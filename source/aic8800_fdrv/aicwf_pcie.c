@@ -1060,7 +1060,18 @@ static int aicwf_pcie_resume(struct pci_dev *pdev)
 	}
 #endif
 
-	fw_started = *(volatile u32 *) (g_rwnx_plat->pcidev->pci_bar0_vaddr + 0x120000) == 0x1a2000;
+	/*
+	 * BAR0 + 0x120000 only exists on boards with a large BAR0 (two or more
+	 * BARs). Single-BAR boards (bar_count == 1, e.g. Ugreen CM958) map just
+	 * 64 KiB, so this read lands outside the mapping and faults inside the
+	 * resume callback, which hangs the whole system on wake. For those boards
+	 * assume the firmware is gone and take the full reload path, which
+	 * already handles bar_count == 1 (see aicwf_resume_access()).
+	 */
+	if (g_rwnx_plat->pcidev->bar_count == 1)
+		fw_started = false;
+	else
+		fw_started = *(volatile u32 *) (g_rwnx_plat->pcidev->pci_bar0_vaddr + 0x120000) == 0x1a2000;
 
 	if(!fw_started) {
 		ret = aicwf_resume_access();
