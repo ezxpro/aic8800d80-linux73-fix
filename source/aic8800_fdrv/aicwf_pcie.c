@@ -5,6 +5,7 @@
 #include <linux/module.h>
 #include <linux/delay.h>
 #include <linux/kthread.h>
+#include <linux/suspend.h>
 #include "aicwf_pcie.h"
 #include "pcie_host.h"
 #include "aicwf_txrxif.h"
@@ -1030,6 +1031,8 @@ static int aicwf_pcie_suspend(struct pci_dev *pdev, pm_message_t state)
 	return ret;
 }
 
+static bool aicwf_need_fw_reload;
+
 static int aicwf_pcie_resume(struct pci_dev *pdev)
 {
 	struct rwnx_hw *rwnx_hw = g_rwnx_plat->pcidev->rwnx_hw;
@@ -1074,11 +1077,16 @@ static int aicwf_pcie_resume(struct pci_dev *pdev)
 		fw_started = *(volatile u32 *) (g_rwnx_plat->pcidev->pci_bar0_vaddr + 0x120000) == 0x1a2000;
 
 	if(!fw_started) {
-		ret = aicwf_resume_access();
-		if (ret) {
-			printk("resume access fail %d\n", ret);
-			return ret;
-		}
+		/*
+		 * The firmware files cannot be opened from inside the resume
+		 * callback: the root filesystem is not accessible yet, so the load
+		 * fails and resume returns an error, leaving the card dead. Defer
+		 * the reload to the PM notifier below, which runs after userspace
+		 * has been thawed. pci_suspending stays set until the reload is done.
+		 */
+		aicwf_need_fw_reload = true;
+		printk("%s: firmware reload deferred until after resume\n", __func__);
+		return 0;
 	} else {
 		printk("resume skip reload\n");
 
@@ -1095,6 +1103,29 @@ static int aicwf_pcie_resume(struct pci_dev *pdev)
 	return ret;
 }
 
+static int aicwf_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	int ret;
+
+	if (action != PM_POST_SUSPEND && action != PM_POST_HIBERNATION)
+		return NOTIFY_DONE;
+
+	if (!aicwf_need_fw_reload || !g_rwnx_plat)
+		return NOTIFY_DONE;
+
+	aicwf_need_fw_reload = false;
+	printk("%s: reloading firmware after resume\n", __func__);
+	ret = aicwf_resume_access();
+	if (ret)
+		printk("%s: resume access fail %d\n", __func__, ret);
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block aicwf_pm_nb = {
+	.notifier_call = aicwf_pm_notify,
+};
+
 static struct pci_driver aicwf_pci_driver = {
 	.name 	   = KBUILD_MODNAME,
 	.id_table  = aic8820_pci_ids,
@@ -1106,11 +1137,16 @@ static struct pci_driver aicwf_pci_driver = {
 
 int aicwf_pcie_register_drv(void)
 {
-	return pci_register_driver(&aicwf_pci_driver);
+	int ret = pci_register_driver(&aicwf_pci_driver);
+
+	if (!ret)
+		register_pm_notifier(&aicwf_pm_nb);
+	return ret;
 }
 
 void aicwf_pcie_unregister_drv(void)
 {
+	unregister_pm_notifier(&aicwf_pm_nb);
 	if (g_rwnx_plat && g_rwnx_plat->enabled){
 #ifdef CONFIG_TEMP_CONTROL
 		spin_lock_bh(&g_rwnx_plat->pcidev->tm_lock);
